@@ -32,11 +32,7 @@ GROUP BY product_id"""
 """How many times each product was bought in the historical events."""
 
 NEW_REQUESTS = """
-SELECT     request_id,
-    user_id,
-    is_new_user,
-    recent_views,
-    context
+SELECT request_id, recent_views
 FROM shop.requests
 ORDER BY ts DESC
 LIMIT 50"""
@@ -88,20 +84,9 @@ def pull(seen: set[str]) -> list[Record]:
 
 def predict(requests: list[Record], best: list[str], unavailable: set[str]) -> list[Record]:
     """One submission per request."""
-    return [
-        {
-            "request_id": req["request_id"],
-            "items": recommend(
-                req["request_id"],
-                req["user_id"],
-                req["is_new_user"],
-                req["recent_views"],
-                unavailable,
-            ),
-            "model_version": "v1",
-        }
-        for req in requests
-    ]
+    return [{"request_id": req["request_id"],
+             "items": recommend(req["recent_views"], best, unavailable),
+             "model_version": "baseline"} for req in requests]
 
 
 def recommend(recent_views: list[Record], best: list[str], unavailable: set[str] = frozenset()) -> list[str]:

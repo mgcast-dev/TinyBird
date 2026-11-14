@@ -2,3 +2,6 @@ requests
 pandas
 numpy
 jupyter
+lightgbm
+scikit-learn
+joblib

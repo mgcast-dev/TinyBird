@@ -6,6 +6,8 @@
 
 ---
 
+
+
 ## The story
 
 An online store sells around 5,000 products in ten categories. On the home page and on every product page there is a row of ten recommended products. Right now that row just shows the **all-time best sellers**. You have to build something that sells more, and it will be tested live, on shoppers arriving in real time.

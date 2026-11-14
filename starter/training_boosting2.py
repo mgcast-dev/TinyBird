@@ -18,6 +18,7 @@ import numpy as np
 import requests
 
 from features import N_FEATURES, build_feature_row, build_state, viewed_from_requests
+from lightgbm import LGBMClassifier
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--cut", default="", help="YYYY-MM-DD: usar solo datos anteriores")
@@ -28,8 +29,8 @@ CUT = args.cut
 SUFFIX = "_cut" if CUT else ""
 NOW = f"toDateTime('{CUT}')" if CUT else "now()"
 
-# 1. Conexión a RawTree
-for line in Path(".env").read_text().splitlines() if Path(".env").exists() else []:
+ROOT = Path(__file__).resolve().parents[1]
+for line in (ROOT / ".env").read_text().splitlines() if (ROOT / ".env").exists() else []:
     key, _, value = line.partition("=")
     os.environ.setdefault(key.strip(), value.strip())
 
@@ -152,21 +153,22 @@ print(f"Ejemplos: {len(y_np)}  positivos: {y_np.mean():.4f}")
 
 # 6. Entrenamiento y guardado
 print("4/4 Entrenando LightGBM...")
-model = lgb.LGBMClassifier(
+MODELS_DIR = Path(__file__).resolve().parent / "models"
+MODELS_DIR.mkdir(parents=True, exist_ok=True)
+model = LGBMClassifier(
     n_estimators=180,
     learning_rate=0.05,
     num_leaves=31,
     random_state=42,
     n_jobs=-1,
 )
-model.fit(X_np, y_np, sample_weight=w_np)
-
-joblib.dump(model, f"modelo_lgbm{SUFFIX}.pkl")
+model.fit(X, y, sample_weight=w)
+joblib.dump(model, MODELS_DIR / f"modelo_lgbm{SUFFIX}.pkl")
 joblib.dump({
     "catalog": catalog,
     "prod_stats": prod_stats,
     "co_matrix": co_matrix,
     "n_features": N_FEATURES,
-}, f"features_data{SUFFIX}.pkl")
+}, MODELS_DIR / f"features_data{SUFFIX}.pkl")
 
-print(f"¡Listo! modelo_lgbm{SUFFIX}.pkl y features_data{SUFFIX}.pkl guardados.")
+print(f"¡Listo! Guardado en {MODELS_DIR}")

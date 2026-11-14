@@ -22,13 +22,14 @@ from features import (N_FEATURES, build_feature_row, build_state,
 # =====================================================================
 # 1. CONFIGURACIÓN Y CARGA
 # =====================================================================
-for line in Path(".env").read_text().splitlines() if Path(".env").exists() else []:
+ROOT = Path(__file__).resolve().parents[1]
+for line in (ROOT / ".env").read_text().splitlines() if (ROOT / ".env").exists() else []:
     key, _, value = line.partition("=")
     os.environ.setdefault(key.strip(), value.strip())
 
 API = os.environ.get("RAWTREE_API_URL", "https://api.rawtree.com")
-TEAM = os.environ["TEAM_ID"]
-HEADERS = {"Authorization": f"Bearer {os.environ['RAWTREE_API_KEY']}"}
+TEAM = os.environ.get("TEAM_ID", "")
+HEADERS = {"Authorization": f"Bearer {os.environ.get('RAWTREE_API_KEY', '')}"}
 
 http_fast = requests.Session()
 http_fast.headers.update(HEADERS)
@@ -36,14 +37,14 @@ http_bg = requests.Session()
 http_bg.headers.update(HEADERS)
 
 Record = dict[str, Any]
-MODEL_VERSION = "v6-lgbm-clean"
+MODEL_VERSION = "v6.1-lgbm-clean"
 DEADLINE_S = 3.0      # plazo desde el ts de la petición
 SAFETY_S = 0.5        # no intentamos responder si ya no llegamos
 BATCH = 20            # tamaño de lote para el push
-
-print("Cargando modelo y features...")
-LGB_MODEL = joblib.load("modelo_lgbm.pkl")
-FEAT = joblib.load("features_data.pkl")
+MODELS_DIR = Path(__file__).resolve().parent / "models"
+SUFFIX = os.environ.get("MODEL_SUFFIX", "")
+LGB_MODEL = joblib.load(MODELS_DIR / f"modelo_lgbm{SUFFIX}.pkl")
+FEAT = joblib.load(MODELS_DIR / f"features_data{SUFFIX}.pkl")
 assert FEAT.get("n_features") == N_FEATURES, "features_data no coincide con features.py"
 assert LGB_MODEL.n_features_in_ == N_FEATURES, "el modelo no coincide con features.py"
 
@@ -202,6 +203,9 @@ def main() -> None:
     seen: set[str] = set()
     lat_ms: list[float] = []
     print(f"Recomendador {MODEL_VERSION} activo.")
+
+    if not TEAM:
+        raise SystemExit("Falta TEAM_ID en .env")
 
     while True:
         try:

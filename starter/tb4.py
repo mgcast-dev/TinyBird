@@ -1,237 +1,172 @@
+"""Entrenamiento de LightGBM sin fugas temporales y con las features compartidas.
+
+    python training_boosting.py                   # modelo final, todos los datos
+    python training_boosting.py --cut 2026-11-07  # modelo para evaluar offline (datos < corte)
+
+Con --cut los ficheros llevan sufijo _cut: modelo_lgbm_cut.pkl y features_data_cut.pkl.
+"""
+from __future__ import annotations
+
+import argparse
 import os
 from collections import defaultdict
 from pathlib import Path
-from datetime import datetime, timezone
+
 import joblib
+import lightgbm as lgb
 import numpy as np
 import requests
-import lightgbm as lgb
 
-for line in (Path(".env").read_text().splitlines() if Path(".env").exists() else []):
+from features import N_FEATURES, build_feature_row, build_state, viewed_from_requests
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--cut", default="", help="YYYY-MM-DD: usar solo datos anteriores")
+parser.add_argument("--sessions", type=int, default=45000)
+args = parser.parse_args()
+
+CUT = args.cut
+SUFFIX = "_cut" if CUT else ""
+NOW = f"toDateTime('{CUT}')" if CUT else "now()"
+
+# 1. Conexión a RawTree
+for line in Path(".env").read_text().splitlines() if Path(".env").exists() else []:
     key, _, value = line.partition("=")
-    if key.strip():
-        os.environ.setdefault(key.strip(), value.strip())
+    os.environ.setdefault(key.strip(), value.strip())
 
 API = os.environ.get("RAWTREE_API_URL", "https://api.rawtree.com")
-API_KEY = os.environ.get("RAWTREE_API_KEY")
-if not API_KEY:
-    raise RuntimeError("Falta RAWTREE_API_KEY en .env")
-
 http = requests.Session()
-http.headers["Authorization"] = f"Bearer {API_KEY}"
+http.headers["Authorization"] = f"Bearer {os.environ['RAWTREE_API_KEY']}"
 
-MODELS_DIR = Path(__file__).resolve().parent / "models"
-MODELS_DIR.mkdir(parents=True, exist_ok=True)
-MODEL_PATH = MODELS_DIR / "modelo_lgbm_v9.pkl"
-FEATURES_PATH = MODELS_DIR / "features_data_v9.pkl"
-K_PRIOR = 50.0
 
-def query(sql: str, timeout: int = 45):
+def query(sql: str, timeout: int = 60) -> list[dict]:
     r = http.post(f"{API}/v1/query", json={"sql": sql}, timeout=timeout)
     r.raise_for_status()
     return r.json()["data"]
 
-print("1/6 Descargando catálogo...")
+
+print(f"Corte temporal: {CUT or 'ninguno (modelo final)'}")
+
+# 2. Catálogo y estadísticas, solo con datos anteriores al corte
+print("1/4 Catálogo y estadísticas por producto...")
 cat_rows = query("""
-SELECT product_id::String AS product_id, category::String AS category,
-       subcategory::String AS subcategory, brand::String AS brand,
-       price_eur::Float64 AS price_eur, created_at
+SELECT product_id::String AS product_id,
+       category::String AS category,
+       subcategory::String AS subcategory,
+       brand::String AS brand,
+       price_eur::Float64 AS price_eur
 FROM shop.catalog
 """)
 catalog = {r["product_id"]: r for r in cat_rows}
 
-print("2/6 Estadísticas de productos...")
-stats_rows = query("""
+stats_rows = query(f"""
 SELECT product_id::String AS product_id,
-    countIf(event_type = 'view') AS views,
-    countIf(event_type = 'add_to_cart') AS carts,
-    countIf(event_type = 'purchase') AS purchases,
-    countIf(event_type = 'view' AND ts >= (SELECT max(ts) - INTERVAL 24 HOUR FROM shop.history_events)) AS views_24h,
-    countIf(event_type = 'add_to_cart' AND ts >= (SELECT max(ts) - INTERVAL 24 HOUR FROM shop.history_events)) AS carts_24h,
-    countIf(event_type = 'purchase' AND ts >= (SELECT max(ts) - INTERVAL 24 HOUR FROM shop.history_events)) AS purchases_24h
+       countIf(event_type = 'view') AS views,
+       countIf(event_type = 'add_to_cart') AS carts,
+       countIf(event_type = 'purchase') AS purchases
 FROM shop.history_events
+WHERE ts::DateTime64(3) < {NOW}
 GROUP BY product_id
 """)
-
-raw = {}
-sub_p = defaultdict(float)
-sub_v = defaultdict(float)
+prod_stats: dict[str, dict[str, float]] = {}
 for r in stats_rows:
-    pid = r["product_id"]
-    rec = {k: float(r.get(k, 0) or 0) for k in
-           ("views", "carts", "purchases", "views_24h", "carts_24h", "purchases_24h")}
-    raw[pid] = rec
-    sc = catalog.get(pid, {}).get("subcategory", "")
-    sub_p[sc] += rec["purchases"]
-    sub_v[sc] += rec["views"]
-
-SUB_CONV = {sc: (sub_p[sc] + 1.0) / (sub_v[sc] + K_PRIOR) for sc in sub_p}
-
-def default_stats(pid: str) -> dict:
-    prior = SUB_CONV.get(catalog.get(pid, {}).get("subcategory", ""), 0.01)
-    return {
-        "views": 0.0, "carts": 0.0, "purchases": 0.0,
-        "conv_rate": prior, "cart_rate": 0.02,
-        "views_24h": 0.0, "carts_24h": 0.0, "purchases_24h": 0.0,
-        "recent_conv_rate": prior, "recent_popularity": 0.0,
-        "product_age_days": 0.0,
-    }
-
-prod_stats = {}
-for pid, rec in raw.items():
-    v, c, p = rec["views"], rec["carts"], rec["purchases"]
-    v24, c24, p24 = rec["views_24h"], rec["carts_24h"], rec["purchases_24h"]
-    prior = SUB_CONV.get(catalog.get(pid, {}).get("subcategory", ""), 0.01)
-    prod_stats[pid] = {
+    v, c, p = float(r["views"]), float(r["carts"]), float(r["purchases"])
+    prod_stats[r["product_id"]] = {
         "views": v, "carts": c, "purchases": p,
-        "conv_rate": (p + K_PRIOR * prior) / (v + K_PRIOR),
+        "conv_rate": (p + 1.0) / (v + 50.0),
         "cart_rate": (c + 1.0) / (v + 20.0),
-        "views_24h": v24, "carts_24h": c24, "purchases_24h": p24,
-        "recent_conv_rate": (p24 + 1.0) / (v24 + 20.0),
-        "recent_popularity": p24 * 10.0 + c24 * 3.0 + v24,
-        "product_age_days": 0.0,
     }
 
-print("3/6 Edad de los productos...")
-now_ts = datetime.now(timezone.utc)
-for pid, info in catalog.items():
-    age = 0.0
-    created_at = info.get("created_at")
-    if created_at and isinstance(created_at, str):
-        try:
-            dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            age = max(0.0, (now_ts - dt).total_seconds() / 86400.0)
-        except Exception:
-            age = 0.0
-    if pid not in prod_stats:
-        prod_stats[pid] = default_stats(pid)
-    prod_stats[pid]["product_age_days"] = age
-
-print("4/6 Co-compras...")
-co_rows = query("""
-SELECT a.product_id AS visto, b.product_id AS recomendado,
-    countIf(b.event_type = 'purchase') * 15 + countIf(b.event_type = 'add_to_cart') * 4 + countIf(b.event_type = 'view') AS score
-FROM (SELECT session_id::String AS session_id, product_id::String AS product_id FROM shop.history_events WHERE event_type = 'view' AND ts > now() - INTERVAL 20 DAY) AS a
-INNER JOIN (SELECT session_id::String AS session_id, product_id::String AS product_id, event_type::String AS event_type FROM shop.history_events WHERE ts > now() - INTERVAL 20 DAY) AS b
-ON a.session_id = b.session_id
+# 3. Co-visitas y co-compras en los 20 días anteriores al corte
+print("2/4 Pares de co-visitas y co-compras...")
+co_rows = query(f"""
+SELECT a.product_id AS visto,
+       b.product_id AS recomendado,
+       countIf(b.event_type = 'purchase') * 15
+       + countIf(b.event_type = 'add_to_cart') * 4
+       + countIf(b.event_type = 'view') AS score
+FROM (
+    SELECT session_id::String AS session_id, product_id::String AS product_id
+    FROM shop.history_events
+    WHERE event_type = 'view'
+      AND ts::DateTime64(3) < {NOW}
+      AND ts::DateTime64(3) > {NOW} - INTERVAL 20 DAY
+) AS a
+INNER JOIN (
+    SELECT session_id::String AS session_id,
+           product_id::String AS product_id,
+           event_type::String AS event_type
+    FROM shop.history_events
+    WHERE ts::DateTime64(3) < {NOW}
+      AND ts::DateTime64(3) > {NOW} - INTERVAL 20 DAY
+) AS b ON a.session_id = b.session_id
 WHERE a.product_id != b.product_id
-GROUP BY visto, recomendado ORDER BY score DESC LIMIT 25 BY visto
-""", timeout=60)
+GROUP BY visto, recomendado
+ORDER BY score DESC
+LIMIT 25 BY visto
+""", timeout=120)
 
-co_matrix = defaultdict(dict)
+co_matrix: dict[str, dict[str, float]] = defaultdict(dict)
 for r in co_rows:
     co_matrix[r["visto"]][r["recomendado"]] = float(r["score"])
+co_matrix = dict(co_matrix)
 
-print("5/6 Sesiones de entrenamiento...")
-sessions = query("""
+# 4. Sesiones de entrenamiento (con clic, más una muestra de negativos)
+print("3/4 Sesiones de shop.history_sessions...")
+sessions = query(f"""
 SELECT recent_views, shown, propensity, clicked, purchased
 FROM shop.history_sessions
-WHERE (clicked IS NOT NULL AND clicked != '') OR rand() % 8 = 0
-LIMIT 90000
+WHERE ts::DateTime64(3) < {NOW}
+  AND ((clicked IS NOT NULL AND clicked != '') OR rand() % 8 = 0)
+LIMIT {args.sessions}
 """, timeout=120)
-print(f"   Sesiones: {len(sessions)}")
 
-def build_features(cand_id: str, viewed_ids: list[str], slot: int) -> list[float]:
-    c_info = catalog.get(cand_id, {})
-    st = prod_stats.get(cand_id) or default_stats(cand_id)
-    c_price = float(c_info.get("price_eur", 25.0))
-    c_cat = c_info.get("category", "")
-    c_subcat = c_info.get("subcategory", "")
-    c_brand = c_info.get("brand", "")
+# 5. Ejemplos: una fila por producto mostrado, con las features compartidas
+state = build_state(catalog, prod_stats, co_matrix)
 
-    same_subcat = same_cat = same_brand = 0.0
-    co_score_total = co_score_last = 0.0
-    viewed_prices = []
-
-    for idx, v_id in enumerate(reversed(viewed_ids)):
-        v_info = catalog.get(v_id)
-        if not v_info:
-            continue
-        weight = 1.0 / (1.0 + 0.5 * idx)
-        if v_info.get("subcategory") == c_subcat:
-            same_subcat += weight
-        if v_info.get("category") == c_cat:
-            same_cat += weight
-        if v_info.get("brand") == c_brand:
-            same_brand += weight
-        pair_score = co_matrix.get(v_id, {}).get(cand_id, 0.0)
-        co_score_total += weight * pair_score
-        if idx == 0:
-            co_score_last = pair_score
-        viewed_prices.append(float(v_info.get("price_eur", c_price)))
-
-    avg_price = sum(viewed_prices) / len(viewed_prices) if viewed_prices else c_price
-    price_ratio = c_price / max(avg_price, 1.0)
-    already_viewed = 1.0 if cand_id in viewed_ids else 0.0
-
-    return [
-        float(st["purchases"]), float(st["conv_rate"]), float(st["cart_rate"]),
-        c_price, price_ratio, same_subcat, same_cat, same_brand,
-        co_score_last, co_score_total, already_viewed, float(slot),
-        float(st["purchases_24h"]), float(st["views_24h"]), float(st["carts_24h"]),
-        float(st.get("product_age_days", 0.0)), float(st["recent_popularity"]),
-    ]
-
-print("6/6 Construyendo dataset y entrenando...")
-X_train, y_train, weights = [], [], []
+X: list[list[float]] = []
+y: list[int] = []
+w: list[float] = []
 for s in sessions:
-    viewed_ids = [v["product_id"] for v in (s.get("recent_views") or [])
-                  if isinstance(v, dict) and "product_id" in v]
+    viewed = viewed_from_requests(s.get("recent_views"))
     shown = s.get("shown") or []
-    props = s.get("propensity") or [0.1] * len(shown)
+    props = s.get("propensity") or []
     clicked = s.get("clicked") or None
     purchased = s.get("purchased") or None
 
-    for idx, cand_id in enumerate(shown):
-        X_train.append(build_features(cand_id, viewed_ids, idx + 1))
-        is_buy = cand_id == purchased
-        is_click = cand_id == clicked
-        y_train.append(1 if (is_buy or is_click) else 0)
+    for idx, cand in enumerate(shown):
+        X.append(build_feature_row(state, cand, viewed))
+        is_buy = cand == purchased
+        is_click = cand == clicked
+        y.append(1 if (is_buy or is_click) else 0)
+
+        # IPS (corrige el sesgo del sistema antiguo) y compra valorada 4x el clic
         prop = float(props[idx]) if idx < len(props) and props[idx] else 0.1
-        ips_w = min(1.0 / max(prop, 0.02), 10.0)
-        if is_buy:
-            ips_w *= 4.0
-        weights.append(ips_w)
+        ips = min(1.0 / max(prop, 0.02), 10.0)
+        w.append(ips * (4.0 if is_buy else 1.0))
 
-X_np = np.array(X_train, dtype=np.float32)
-y_np = np.array(y_train, dtype=np.int32)
-w_np = np.array(weights, dtype=np.float32)
+X_np = np.asarray(X, dtype=np.float32)
+y_np = np.asarray(y, dtype=np.int32)
+w_np = np.asarray(w, dtype=np.float32)
+assert X_np.shape[1] == N_FEATURES, "número de features distinto al de features.py"
+print(f"Ejemplos: {len(y_np)}  positivos: {y_np.mean():.4f}")
 
-if X_np.ndim != 2 or X_np.shape[1] != 17:
-    raise RuntimeError(f"ERROR: dataset con shape {X_np.shape}, se esperaban 17 features")
-
+# 6. Entrenamiento y guardado
+print("4/4 Entrenando LightGBM...")
 model = lgb.LGBMClassifier(
-    n_estimators=300,
-    learning_rate=0.04,
+    n_estimators=180,
+    learning_rate=0.05,
     num_leaves=31,
-    min_child_samples=50,
-    subsample=0.8,
-    subsample_freq=1,
-    colsample_bytree=0.8,
     random_state=42,
     n_jobs=-1,
 )
 model.fit(X_np, y_np, sample_weight=w_np)
 
-EXPECTED_FEATURE_NAMES = [
-    "purchases", "conv_rate", "cart_rate", "price", "price_ratio",
-    "same_subcat", "same_cat", "same_brand", "co_score_last", "co_score_total",
-    "already_viewed", "slot", "purchases_24h", "views_24h", "carts_24h",
-    "product_age_days", "recent_popularity",
-]
-
-joblib.dump(model, MODEL_PATH)
+joblib.dump(model, f"modelo_lgbm{SUFFIX}.pkl")
 joblib.dump({
     "catalog": catalog,
     "prod_stats": prod_stats,
-    "co_matrix": dict(co_matrix),
-    "sub_conv": SUB_CONV,
-    "feature_names": EXPECTED_FEATURE_NAMES,
-}, FEATURES_PATH)
+    "co_matrix": co_matrix,
+    "n_features": N_FEATURES,
+}, f"features_data{SUFFIX}.pkl")
 
-print("ENTRENAMIENTO TERMINADO")
-print(f"Ejemplos: {len(X_np)} | Features: {X_np.shape[1]}")
-print(f"Modelo: {MODEL_PATH}")
-print(f"Datos:  {FEATURES_PATH}")
+print(f"¡Listo! modelo_lgbm{SUFFIX}.pkl y features_data{SUFFIX}.pkl guardados.")

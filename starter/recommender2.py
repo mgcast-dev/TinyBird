@@ -140,22 +140,21 @@ def finalize(items: list[str]) -> list[str]:
     return out
 
 
-def predict_batch(batch):
-    answers = {}
+def predict_batch(batch) -> list[Record]:
+    out: list[Record] = []
     for req in batch:
+        rid = req["request_id"]
         viewed = viewed_from_requests(req.get("recent_views"))
-        if not viewed:                          # usuario frío
-            answers[req["request_id"]] = finalize(FALLBACK)
-            continue
-        cands = get_candidates(STATE, viewed, ACTIVE)
+        cands = get_candidates(STATE, viewed, ACTIVE) if viewed else []
         if not cands:
-            answers[req["request_id"]] = finalize(FALLBACK)
-            continue
-        X = np.nan_to_num(np.array([build_feature_row(STATE, c, viewed) for c in cands], dtype=np.float32))
-        p = LGB_MODEL.predict_proba(X)[:, 1]
-        ranked = [cands[i] for i in np.argsort(p)[::-1]]
-        answers[req["request_id"]] = finalize(ranked)
-    return answers
+            items = finalize(FALLBACK)
+        else:
+            X = np.nan_to_num(np.array(
+                [build_feature_row(STATE, c, viewed) for c in cands], dtype=np.float32))
+            p = LGB_MODEL.predict_proba(X)[:, 1]
+            items = finalize([cands[i] for i in np.argsort(p)[::-1]])
+        out.append({"request_id": rid, "items": items, "model_version": MODEL_VERSION})
+    return out
 
 # =====================================================================
 # 5. ENVÍO Y TIEMPOS

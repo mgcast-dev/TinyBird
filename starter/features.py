@@ -28,6 +28,14 @@ def build_state(catalog: dict, prod_stats: dict, co_matrix: dict) -> dict[str, A
         if sc and len(top_by_subcat[sc]) < 20:
             top_by_subcat[sc].append(pid)
 
+    # Productos fríos: en el catálogo pero sin ninguna estadística previa al corte
+    cold_by_subcat: dict[str, list[str]] = defaultdict(list)
+    for pid, meta in catalog.items():
+        if pid not in prod_stats:
+            sc = meta.get("subcategory", "")
+            if sc:
+                cold_by_subcat[sc].append(pid)
+
     co_top = {
         v: [c for c, _ in sorted(recs.items(), key=lambda x: x[1], reverse=True)[:15]]
         for v, recs in co_matrix.items()
@@ -38,6 +46,7 @@ def build_state(catalog: dict, prod_stats: dict, co_matrix: dict) -> dict[str, A
         "co_matrix": co_matrix,
         "top_global": top_global,
         "top_by_subcat": dict(top_by_subcat),
+        "cold_by_subcat": dict(cold_by_subcat),
         "co_top": co_top,
     }
 
@@ -105,6 +114,8 @@ def get_candidates(state: dict, viewed_ids: list[str], active: set[str],
             add(cid)
         sc = state["catalog"].get(v_id, {}).get("subcategory", "")
         for cid in state["top_by_subcat"].get(sc, [])[:8]:
+            add(cid)
+        for cid in state.get("cold_by_subcat", {}).get(sc, [])[:3]:
             add(cid)
         if len(cands) >= 25:
             break

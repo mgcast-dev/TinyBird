@@ -162,7 +162,7 @@ model = LGBMClassifier(
     random_state=42,
     n_jobs=-1,
 )
-model.fit(X, y, sample_weight=w)
+model.fit(X, y, sample_weight=w_np)
 joblib.dump(model, MODELS_DIR / f"modelo_lgbm{SUFFIX}.pkl")
 joblib.dump({
     "catalog": catalog,

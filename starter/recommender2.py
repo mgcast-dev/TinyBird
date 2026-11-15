@@ -37,7 +37,7 @@ http_bg = requests.Session()
 http_bg.headers.update(HEADERS)
 
 Record = dict[str, Any]
-MODEL_VERSION = "v6.1-lgbm-clean"
+MODEL_VERSION = "v6.2-lgbm-clean"
 DEADLINE_S = 3.0      # plazo desde el ts de la petición
 SAFETY_S = 0.5        # no intentamos responder si ya no llegamos
 BATCH = 20            # tamaño de lote para el push
@@ -140,31 +140,21 @@ def finalize(items: list[str]) -> list[str]:
     return out
 
 
-def predict_batch(batch: list[Record]) -> list[Record]:
-    rows: list[list[float]] = []
-    slices: list[tuple[str, list[str], int, int]] = []
-
+def predict_batch(batch):
+    answers = {}
     for req in batch:
         viewed = viewed_from_requests(req.get("recent_views"))
+        if not viewed:                          # usuario frío
+            answers[req["request_id"]] = finalize(FALLBACK)
+            continue
         cands = get_candidates(STATE, viewed, ACTIVE)
-        start = len(rows)
-        rows.extend(build_feature_row(STATE, c, viewed) for c in cands)
-        slices.append((req["request_id"], cands, start, len(rows)))
-
-    probs = (LGB_MODEL.predict_proba(np.asarray(rows, dtype=np.float32))[:, 1]
-             if rows else np.array([]))
-
-    answers: list[Record] = []
-    for rid, cands, s, e in slices:
-        ranked: list[str] = []
-        if e > s:
-            order = np.argsort(probs[s:e])[::-1]
-            ranked = [cands[i] for i in order]
-        answers.append({
-            "request_id": rid,
-            "items": finalize(ranked),
-            "model_version": MODEL_VERSION,
-        })
+        if not cands:
+            answers[req["request_id"]] = finalize(FALLBACK)
+            continue
+        X = np.nan_to_num(np.array([build_feature_row(STATE, c, viewed) for c in cands], dtype=np.float32))
+        p = LGB_MODEL.predict_proba(X)[:, 1]
+        ranked = [cands[i] for i in np.argsort(p)[::-1]]
+        answers[req["request_id"]] = finalize(ranked)
     return answers
 
 # =====================================================================

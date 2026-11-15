@@ -87,11 +87,21 @@ UNAVAILABLE_SET: set[str] = {pid for pid, product in CATALOG.items() if not prod
 DATA_LOCK = threading.RLock()
 LAST_LIVE_EVENT_TS: str | None = None
 
+# Estado actual = shop.catalog con la última actualización de shop.catalog_updates
+# encima (out_of_stock llega con is_active=false, back_in_stock con true).
+# Antes solo se leía shop.catalog y nunca se veían las roturas de stock del evento.
 UNAVAILABLE_SQL = """
-SELECT product_id::String AS product_id
-FROM shop.catalog
-WHERE toString(is_active) IN ('false', '0')
-LIMIT 5000
+SELECT product_id
+FROM (
+    SELECT product_id::String AS product_id, toString(is_active) AS active, '' AS v
+    FROM shop.catalog
+    UNION ALL
+    SELECT product_id::String, toString(is_active), toString(ts::DateTime64(3))
+    FROM shop.catalog_updates
+)
+GROUP BY product_id
+HAVING argMax(active, v) IN ('false', '0')
+LIMIT 20000
 """
 LIVE_STATS_SQL = """
 SELECT product_id::String AS product_id,
@@ -378,15 +388,30 @@ def predict_batch(requests_batch: list[Record]) -> list[Record]:
 
     matrix = np.asarray(rows, dtype=np.float32)
     scores = LGB_MODEL.booster_.predict(matrix)
+    # Vuelve a leer el stock justo antes de enviar: puede haber cambiado
+    # mientras se puntuaba el lote.
+    with DATA_LOCK:
+        active_now = set(ACTIVE_IDS) - UNAVAILABLE_SET
     result = []
     for request_id, candidates, start, end in records:
-        if not candidates:
-            items = [pid for pid in TOP_GLOBAL_HIST if pid in active][:10]
-        else:
-            order = np.argsort(scores[start:end])[::-1][:10]
-            items = [candidates[i] for i in order]
+        ranked = [candidates[i] for i in np.argsort(scores[start:end])[::-1]] if candidates else []
+        items = _finalize_items(ranked, active_now)
         result.append({"request_id": request_id, "items": items, "model_version": "v9-lgbm-hardneg"})
     return result
+
+
+def _finalize_items(ranked: list[str], active: set[str]) -> list[str]:
+    """Garantiza exactamente 10 IDs distintos y en stock (si no, la respuesta es inválida)."""
+    items: list[str] = []
+    seen: set[str] = set()
+    for pid in list(ranked) + TOP_GLOBAL_HIST + list(active):
+        pid = str(pid)
+        if pid in active and pid not in seen:
+            seen.add(pid)
+            items.append(pid)
+            if len(items) == 10:
+                break
+    return items
 
 
 def _parse_time(value: Any) -> datetime | None:
@@ -444,17 +469,7 @@ def bg_worker() -> None:
     feedback_first_read = False
     while True:
         try:
-            response = http_bg.post(
-                f"{API}/v1/query",
-                json={"sql": UNAVAILABLE_SQL},
-                timeout=(0.5, 3.0),
-            )
-            response.raise_for_status()
-            unavailable_rows = response.json().get("data", [])
-            with DATA_LOCK:
-                UNAVAILABLE_SET = {str(row["product_id"]) for row in unavailable_rows if row.get("product_id")}
-                ACTIVE_IDS = set(CATALOG) - UNAVAILABLE_SET
-
+            # El stock lo refresca stock_worker() cada segundo.
             if time.time() - last_live >= 30.:
                 last_live = time.time()
                 live_response = http_bg.post(
@@ -583,25 +598,39 @@ LIMIT 5000"""
         time.sleep(2.)
 
 
-def refresh_unavailable() -> None:
-    """Carga la lista de stock agotado antes de empezar a aceptar peticiones."""
+def refresh_unavailable(session: requests.Session = http_fast, verbose: bool = True) -> None:
+    """Carga la lista de productos agotados/inactivos (catálogo + actualizaciones)."""
     global ACTIVE_IDS, UNAVAILABLE_SET
-    response = http_fast.post(
+    response = session.post(
         f"{API}/v1/query",
         json={"sql": UNAVAILABLE_SQL},
-        timeout=(1.0, 2.0),
+        timeout=(1.0, 3.0),
     )
     response.raise_for_status()
     rows = response.json().get("data", [])
     with DATA_LOCK:
         UNAVAILABLE_SET = {str(row["product_id"]) for row in rows if row.get("product_id")}
         ACTIVE_IDS = set(CATALOG) - UNAVAILABLE_SET
-    print(f"[STOCK] Inicializado: {len(UNAVAILABLE_SET)} productos inactivos.", flush=True)
+    if verbose:
+        print(f"[STOCK] Inicializado: {len(UNAVAILABLE_SET)} productos inactivos.", flush=True)
+
+
+def stock_worker() -> None:
+    """Refresca el stock cada segundo en su propio hilo, sin esperar a las consultas lentas."""
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    while True:
+        try:
+            refresh_unavailable(session, verbose=False)
+        except Exception as exc:
+            print(f"[STOCK aviso] {exc}", flush=True)
+        time.sleep(1.)
 
 
 def main() -> None:
     # No arranca el polling hasta conocer el inventario inactivo actual.
     refresh_unavailable()
+    threading.Thread(target=stock_worker, daemon=True, name="tinybird-stock-worker").start()
     threading.Thread(target=bg_worker, daemon=True, name="tinybird-bg-worker").start()
     SEEN_REQUESTS: set[str] = set()
     print("Recomendador v9-lgbm22-hardneg activo")
